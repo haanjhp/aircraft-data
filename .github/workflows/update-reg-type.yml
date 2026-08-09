@@ -1,0 +1,61 @@
+name: Update reg_type.csv
+
+on:
+  schedule:
+    # Daily at 06:00 KST (21:00 UTC on the previous day).
+    - cron: "0 21 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-reg-type
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Update aircraft data
+        env:
+          ODCLOUD_SERVICE_KEY: ${{ secrets.ODCLOUD_SERVICE_KEY }}
+        run: python scripts/update_reg_type.py
+
+      - name: Add run summary
+        if: always()
+        run: |
+          if [[ -s unmatched_types.csv ]]; then
+            count=$(($(wc -l < unmatched_types.csv) - 1))
+            echo "::warning::${count} aircraft registrations have no ICAO match."
+            echo "### Unmatched aircraft types: ${count}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### All aircraft types matched" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Commit changed data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A -- reg_type.csv reg_type_meta.json
+          if [[ -e unmatched_types.csv ]]; then
+            git add -- unmatched_types.csv
+          else
+            git rm --ignore-unmatch -- unmatched_types.csv
+          fi
+          if git diff --cached --quiet; then
+            echo "No data changes"
+            exit 0
+          fi
+          git commit -m "chore: update aircraft registration data"
+          git push
