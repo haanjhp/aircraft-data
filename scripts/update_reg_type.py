@@ -11,6 +11,7 @@ import re
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -26,6 +27,11 @@ ODCLOUD_URL = (
     "https://api.odcloud.kr/api/3048607/v1/"
     "uddi:ce7bfe62-e127-4066-8325-d814a360e3df"
 )
+
+REQUEST_TIMEOUT_SECONDS = 45
+REQUEST_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 2
+RETRYABLE_HTTP_STATUS = {408, 429, 500, 502, 503, 504}
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_CSV = ROOT / "reg_type.csv"
@@ -68,14 +74,67 @@ ATIS_FIELDS = {
 }
 
 
-def request_json(url: str, headers: dict[str, str] | None = None):
+def request_error_message(error: Exception) -> str:
+    """Return a useful error without leaking a URL that may contain a service key."""
+    if isinstance(error, urllib.error.HTTPError):
+        return f"HTTP {error.code} {error.reason}"
+    if isinstance(error, urllib.error.URLError):
+        return str(error.reason)
+    return str(error)
+
+
+def request_json(
+    url: str,
+    headers: dict[str, str] | None = None,
+    *,
+    source: str,
+    attempts: int = REQUEST_ATTEMPTS,
+):
+    if attempts < 1:
+        raise ValueError("attempts must be at least 1")
+
     request = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(request, timeout=45) as response:
-        payload = json.loads(response.read().decode("utf-8-sig"))
-    # ATIS currently returns a JSON object encoded inside a JSON string.
-    if isinstance(payload, str):
-        payload = json.loads(payload)
-    return payload
+    last_error: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(
+                request, timeout=REQUEST_TIMEOUT_SECONDS
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8-sig"))
+            # ATIS currently returns a JSON object encoded inside a JSON string.
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            return payload
+        except urllib.error.HTTPError as error:
+            if error.code not in RETRYABLE_HTTP_STATUS:
+                raise RuntimeError(
+                    f"{source} request failed: {request_error_message(error)}"
+                ) from error
+            last_error = error
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+        ) as error:
+            last_error = error
+
+        if attempt < attempts:
+            delay = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            print(
+                f"warning: {source} request attempt {attempt}/{attempts} failed "
+                f"({request_error_message(last_error)}); retrying in {delay}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+
+    assert last_error is not None
+    raise RuntimeError(
+        f"{source} request failed after {attempts} attempts: "
+        f"{request_error_message(last_error)}"
+    ) from last_error
 
 
 def fetch_atis() -> list[dict[str, object]]:
@@ -87,6 +146,7 @@ def fetch_atis() -> list[dict[str, object]]:
             "Referer": ATIS_REFERER,
             "X-Requested-With": "XMLHttpRequest",
         },
+        source="ATIS",
     )
     rows = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(rows, list):
@@ -104,7 +164,9 @@ def fetch_odcloud(service_key: str) -> list[dict[str, object]]:
             {"page": page, "perPage": 500, "serviceKey": decoded_key}
         )
         payload = request_json(
-            f"{ODCLOUD_URL}?{query}", {"Accept": "application/json"}
+            f"{ODCLOUD_URL}?{query}",
+            {"Accept": "application/json"},
+            source=f"ODCloud page {page}",
         )
         batch = payload.get("data", []) if isinstance(payload, dict) else []
         if not isinstance(batch, list):
