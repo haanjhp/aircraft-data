@@ -31,6 +31,8 @@ ODCLOUD_URL = (
 REQUEST_TIMEOUT_SECONDS = 45
 REQUEST_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = 2
+ATIS_RETRY_DELAYS_SECONDS = (30, 90, 180)
+MAX_SKIPPED_ATIS_ROWS = 3
 RETRYABLE_HTTP_STATUS = {408, 429, 500, 502, 503, 504}
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -89,22 +91,45 @@ def request_json(
     *,
     source: str,
     attempts: int = REQUEST_ATTEMPTS,
+    retry_delays: tuple[int, ...] | None = None,
 ):
     if attempts < 1:
         raise ValueError("attempts must be at least 1")
+    if retry_delays is None:
+        retry_delays = tuple(
+            RETRY_BACKOFF_SECONDS * (2 ** index)
+            for index in range(attempts - 1)
+        )
+    if len(retry_delays) != attempts - 1:
+        raise ValueError("retry_delays must have one entry per retry")
 
     request = urllib.request.Request(url, headers=headers or {})
     last_error: Exception | None = None
+    last_stage = "connect/headers"
 
     for attempt in range(1, attempts + 1):
+        started = time.monotonic()
+        stage = "connect/headers"
         try:
             with urllib.request.urlopen(
                 request, timeout=REQUEST_TIMEOUT_SECONDS
             ) as response:
-                payload = json.loads(response.read().decode("utf-8-sig"))
+                status = getattr(response, "status", "unknown")
+                headers_seconds = time.monotonic() - started
+                stage = "read body"
+                body = response.read()
+            read_seconds = time.monotonic() - started
+            stage = "decode JSON"
+            payload = json.loads(body.decode("utf-8-sig"))
             # ATIS currently returns a JSON object encoded inside a JSON string.
             if isinstance(payload, str):
                 payload = json.loads(payload)
+            print(
+                f"{source} request attempt {attempt}/{attempts} succeeded: "
+                f"HTTP {status}, headers={headers_seconds:.1f}s, "
+                f"body={read_seconds - headers_seconds:.1f}s, bytes={len(body)}",
+                flush=True,
+            )
             return payload
         except urllib.error.HTTPError as error:
             if error.code not in RETRYABLE_HTTP_STATUS:
@@ -119,11 +144,14 @@ def request_json(
             UnicodeDecodeError,
         ) as error:
             last_error = error
+        last_stage = stage
+        elapsed = time.monotonic() - started
 
         if attempt < attempts:
-            delay = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            delay = retry_delays[attempt - 1]
             print(
                 f"warning: {source} request attempt {attempt}/{attempts} failed "
+                f"during {stage} after {elapsed:.1f}s "
                 f"({request_error_message(last_error)}); retrying in {delay}s",
                 file=sys.stderr,
                 flush=True,
@@ -132,7 +160,8 @@ def request_json(
 
     assert last_error is not None
     raise RuntimeError(
-        f"{source} request failed after {attempts} attempts: "
+        f"{source} request failed after {attempts} attempts during "
+        f"{last_stage}: "
         f"{request_error_message(last_error)}"
     ) from last_error
 
@@ -147,11 +176,30 @@ def fetch_atis() -> list[dict[str, object]]:
             "X-Requested-With": "XMLHttpRequest",
         },
         source="ATIS",
+        attempts=len(ATIS_RETRY_DELAYS_SECONDS) + 1,
+        retry_delays=ATIS_RETRY_DELAYS_SECONDS,
     )
     rows = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(rows, list):
         raise RuntimeError("ATIS response does not contain a data array")
-    return rows
+    valid_rows = [
+        row for row in rows
+        if isinstance(row, dict) and normalized(row.get("REG_SNO"))
+    ]
+    skipped = len(rows) - len(valid_rows)
+    if skipped > MAX_SKIPPED_ATIS_ROWS:
+        raise RuntimeError(
+            f"ATIS contains {skipped} rows without a registration; "
+            "refusing to publish"
+        )
+    if skipped:
+        print(
+            f"warning: ATIS skipped {skipped} rows without a registration "
+            f"(out of {len(rows)})",
+            file=sys.stderr,
+            flush=True,
+        )
+    return valid_rows
 
 
 def fetch_odcloud(service_key: str) -> list[dict[str, object]]:

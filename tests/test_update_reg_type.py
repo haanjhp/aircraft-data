@@ -9,8 +9,11 @@ from scripts import update_reg_type
 
 
 class FakeResponse:
-    def __init__(self, payload):
+    status = 201
+
+    def __init__(self, payload, error=None):
         self.body = json.dumps(payload).encode("utf-8")
+        self.error = error
 
     def __enter__(self):
         return self
@@ -19,6 +22,8 @@ class FakeResponse:
         return False
 
     def read(self):
+        if self.error:
+            raise self.error
         return self.body
 
 
@@ -49,7 +54,7 @@ class RequestJsonTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             RuntimeError,
-            "ATIS request failed after 3 attempts: timed out",
+            "ATIS request failed after 3 attempts during connect/headers: timed out",
         ):
             update_reg_type.request_json(
                 "https://example.invalid/data", source="ATIS"
@@ -57,6 +62,36 @@ class RequestJsonTests(unittest.TestCase):
 
         self.assertEqual(urlopen.call_count, 3)
         self.assertEqual(sleep.call_args_list, [mock.call(2), mock.call(4)])
+
+    @mock.patch.object(update_reg_type.time, "sleep")
+    @mock.patch.object(update_reg_type.urllib.request, "urlopen")
+    def test_reports_body_read_timeout_and_custom_retry_delays(self, urlopen, sleep):
+        urlopen.side_effect = [
+            FakeResponse({}, error=TimeoutError("timed out")),
+            FakeResponse({"data": []}),
+        ]
+        stderr = io.StringIO()
+
+        with redirect_stderr(stderr):
+            result = update_reg_type.request_json(
+                "https://example.invalid/data",
+                source="ATIS",
+                attempts=2,
+                retry_delays=(30,),
+            )
+
+        self.assertEqual(result, {"data": []})
+        sleep.assert_called_once_with(30)
+        self.assertIn("failed during read body", stderr.getvalue())
+
+    def test_rejects_mismatched_retry_delays(self):
+        with self.assertRaisesRegex(ValueError, "retry_delays"):
+            update_reg_type.request_json(
+                "https://example.invalid/data",
+                source="ATIS",
+                attempts=3,
+                retry_delays=(30,),
+            )
 
     @mock.patch.object(update_reg_type.urllib.request, "urlopen")
     def test_does_not_retry_or_leak_url_for_auth_error(self, urlopen):
@@ -81,6 +116,44 @@ class RequestJsonTests(unittest.TestCase):
         )
         self.assertNotIn("secret", message)
         urlopen.assert_called_once()
+
+
+class AtisDataTests(unittest.TestCase):
+    @mock.patch.object(update_reg_type, "request_json")
+    def test_skips_one_missing_registration(self, request_json):
+        request_json.return_value = {
+            "data": [
+                {"REG_SNO": "HL1234"},
+                {"REG_SNO": "", "SNO": "source-row"},
+                {"REG_SNO": "HL5678"},
+            ]
+        }
+        stderr = io.StringIO()
+
+        with redirect_stderr(stderr):
+            rows = update_reg_type.fetch_atis()
+
+        self.assertEqual([row["REG_SNO"] for row in rows], ["HL1234", "HL5678"])
+        self.assertIn("skipped 1 rows without a registration", stderr.getvalue())
+        self.assertEqual(request_json.call_args.kwargs["attempts"], 4)
+        self.assertEqual(
+            request_json.call_args.kwargs["retry_delays"], (30, 90, 180)
+        )
+
+    @mock.patch.object(update_reg_type, "request_json")
+    def test_rejects_many_missing_registrations(self, request_json):
+        request_json.return_value = {
+            "data": [{"REG_SNO": "HL1234"}] + [{"REG_SNO": ""}] * 4
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "4 rows without a registration"):
+            update_reg_type.fetch_atis()
+
+    def test_existing_row_count_and_duplicate_guards_remain(self):
+        with self.assertRaisesRegex(RuntimeError, "only 1 ATIS rows"):
+            update_reg_type.validate([{"등록기호": "HL1234"}])
+        with self.assertRaisesRegex(RuntimeError, "duplicate registrations"):
+            update_reg_type.validate([{"등록기호": "HL1234"}] * 800)
 
 
 if __name__ == "__main__":
