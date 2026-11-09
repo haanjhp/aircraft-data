@@ -1,8 +1,8 @@
 {
-  "version": 1794096223,
-  "updatedAt": "2026-11-08T00:03:43.413068Z",
+  "version": 1794183181,
+  "updatedAt": "2026-11-09T00:13:01.562744Z",
   "csvUrl": "https://raw.githubusercontent.com/haanjhp/aircraft-data/main/reg_type.csv",
-  "sha256": "a7c390baa6531b5689a932363703825bd1e94e02de467f1c844f81f7f3d77c1d",
+  "sha256": "f9c9b930812d127392a907804325c8186f6a0563da0d4b741d8fcf2ebcdbff5c",
   "size": 116190,
   "rowCount": 910
 }
